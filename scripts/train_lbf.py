@@ -1,8 +1,8 @@
 """
-ETD-MAPPO Training Script for Google Research Football (GRF)
+ETD-MAPPO Training Script for Level-Based Foraging (LBF)
 
 This script implements comprehensive tracking for:
-- Win Rate / Task Performance (Goals scored)
+- Win Rate / Task Performance
 - Money Shot Timeline Visualization
 - Per-Agent Temporal Specialization
 - Baseline Comparison (Vanilla vs Fixed-Skip vs ETD)
@@ -22,7 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from algorithms.ppo.buffer import AsynchronousRolloutBuffer
 from algorithms.ppo.loss import compute_masked_ppo_loss
-from envs.grf_wrapper import AsynchronousGRFWrapper
+from envs.lbf_wrapper import AsynchronousLBFWrapper
 from models.rnn_networks import AsynchronousGRUActor, AsynchronousGRUCritic
 from utils.wandb_logger import (
     AdaptiveEntropyScheduler,
@@ -36,64 +36,52 @@ from utils.wandb_logger import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='ETD-MAPPO GRF Comprehensive Evaluator')
+    parser = argparse.ArgumentParser(description='ETD-MAPPO LBF Comprehensive Evaluator')
     parser.add_argument('--mode', type=str, default='etd', choices=['etd', 'vanilla', 'fixed_skip'])
-    parser.add_argument('--fixed_skip_amount', type=int, default=4)
-    parser.add_argument('--scenario_name', type=str, default='academy_3_vs_1_with_keeper')
-    parser.add_argument('--num_left_players', type=int, default=3)
+    parser.add_argument('--fixed_skip_amount', type=int, default=3)
+    parser.add_argument('--map_name', type=str, default='Foraging-8x8-3p-3f-v3')
     parser.add_argument('--num_envs', type=int, default=1)
-    parser.add_argument('--num_updates', type=int, default=2000)
-    parser.add_argument('--eval_interval', type=int, default=200, help='Run evaluation every N updates')
+    parser.add_argument('--num_updates', type=int, default=1000)
+    parser.add_argument('--eval_interval', type=int, default=100, help='Run evaluation every N updates')
     parser.add_argument('--save_figures', action='store_true', help='Save Money Shot figures locally')
     return parser.parse_args()
 
 
-def determine_success(total_reward, episode_length):
+def determine_success(rewards_dict, episode_length):
     """
-    Determine if a GRF episode was successful.
-    Success = scored a goal (positive reward).
+    Determine if an LBF episode was successful.
+    Success = collected at least one food item (positive total reward).
     """
+    total_reward = sum(rewards_dict.values()) if isinstance(rewards_dict, dict) else rewards_dict
     return total_reward > 0
 
 
 def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[*] Initializing GRF '{args.scenario_name}' on device: {device} | Mode: {args.mode.upper()}")
+    print(f"[*] Initializing LBF '{args.map_name}' on device: {device} | Mode: {args.mode.upper()}")
 
     # Create output directory for figures
     output_dir = os.path.join(os.path.dirname(__file__), '..', 'outputs')
     os.makedirs(output_dir, exist_ok=True)
 
-    wandb.init(
-        project='ETD-MAPPO-Research', name=f'GRF-{args.scenario_name}-{args.mode}-comprehensive', config=vars(args)
-    )
+    wandb.init(project='ETD-MAPPO-Research', name=f'LBF-{args.map_name}-{args.mode}-comprehensive', config=vars(args))
 
-    try:
-        env = AsynchronousGRFWrapper(
-            env_name=args.scenario_name, number_of_left_players_agent_controls=args.num_left_players
-        )
-    except Exception as e:
-        print(f'[!] GRF initialization failed: {e}')
-        print('[*] Continuing with mock environment for architecture verification...')
-        env = AsynchronousGRFWrapper(
-            env_name=args.scenario_name, number_of_left_players_agent_controls=args.num_left_players
-        )
+    env = AsynchronousLBFWrapper(env_id=args.map_name)
 
     # Hyperparameters
-    num_steps = 128
+    num_steps = 100
     num_updates = args.num_updates
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.2
     ent_coef = 0.01
     vf_coef = 0.5
-    hidden_size = 128  # Larger for GRF
+    hidden_size = 64
 
-    max_sleep_ticks = args.fixed_skip_amount if args.mode == 'fixed_skip' else 4
+    max_sleep_ticks = args.fixed_skip_amount if args.mode == 'fixed_skip' else 3
 
     # Mode-specific entropy scheduler
-    # GRF has 19 actions, so max entropy is ~2.94
     if args.mode == 'vanilla':
         entropy_scheduler = AdaptiveEntropyScheduler(
             initial_threshold=-1.0, final_threshold=-1.0, total_updates=num_updates
@@ -103,9 +91,9 @@ def main():
             initial_threshold=999.0, final_threshold=999.0, total_updates=num_updates
         )
     else:
-        # ETD: Higher thresholds for larger action space
+        # ETD: Start conservative, gradually allow more sleep
         entropy_scheduler = AdaptiveEntropyScheduler(
-            initial_threshold=1.5, final_threshold=2.8, total_updates=num_updates
+            initial_threshold=0.5, final_threshold=1.75, total_updates=num_updates
         )
 
     agents = env.possible_agents
@@ -128,7 +116,7 @@ def main():
 
         buffers[a] = AsynchronousRolloutBuffer(num_steps, obs_dim, (), device)
 
-    print(f'[*] Networks constructed for {len(agents)} GRF agents.')
+    print(f'[*] Networks constructed for {len(agents)} LBF agents.')
 
     # Initialize performance tracker
     tracker = PerformanceTracker(agents)
@@ -153,7 +141,7 @@ def main():
         # Tracking variables
         saved_inferences = 0
         total_evaluations = 0
-        episode_reward_sum = 0.0
+        episode_rewards_sum = {a: 0.0 for a in agents}
         episodes_completed = 0
 
         # Rollout phase
@@ -209,13 +197,12 @@ def main():
             # Track performance
             tracker.step(rewards_dict, active_masks, step_entropies)
 
-            step_reward = sum(rewards_dict.values())
-            episode_reward_sum += step_reward
-
             for a in agents:
                 mask_val = active_masks.get(a, 0.0)
                 reward = rewards_dict.get(a, 0.0)
                 done = dones_dict.get(a, False)
+
+                episode_rewards_sum[a] += reward
 
                 if mask_val == 0.0:
                     saved_inferences += 1
@@ -236,12 +223,12 @@ def main():
 
             # Episode termination
             if all(dones_dict.values()):
-                success = determine_success(episode_reward_sum, step + 1)
+                success = determine_success(episode_rewards_sum, step + 1)
                 tracker.end_episode(success=success)
                 episodes_completed += 1
 
                 # Reset for new episode
-                episode_reward_sum = 0.0
+                episode_rewards_sum = {a: 0.0 for a in agents}
                 obs_dicts, global_states, next_avail_dicts = env.reset()
                 next_obs = {a: torch.tensor(obs_dicts[a], dtype=torch.float32).to(device) for a in agents}
                 actor_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
@@ -299,7 +286,10 @@ def main():
         # Calculate average entropy for this update
         avg_entropy = np.mean([step_entropies[a] for a in agents]) if step_entropies else 0.0
 
-        # Log to WandB - include more metrics
+        # Calculate total episode reward for this update
+        episode_reward_sum = sum(episode_rewards_sum.values())
+
+        # Log to WandB - standardized metrics across all environments
         log_dict = {
             'compute/FLOP_reduction_pct': flop_reduction_pct,
             'compute/saved_inferences': saved_inferences,
@@ -317,7 +307,6 @@ def main():
 
         wandb.log(log_dict, step=update)
 
-        # Periodic detailed logging
         if update % args.eval_interval == 0:
             print(f'\n{"=" * 70}')
             print(f'Update {update}/{num_updates} | Mode: {args.mode.upper()}')
@@ -331,10 +320,8 @@ def main():
             if 'performance/episode_reward_mean' in perf_metrics:
                 print(f'  Mean Episode Reward: {perf_metrics["performance/episode_reward_mean"]:.2f}')
 
-            # Log temporal specialization
             log_temporal_specialization(tracker, update)
 
-            # Generate Money Shot timeline
             print('\n[*] Generating Money Shot Timeline...')
             timeline_data, total_reward = log_episode_timeline(
                 env,
@@ -346,17 +333,16 @@ def main():
                 episode=f'Update{update}',
             )
 
-            # Save figure locally if requested
             if args.save_figures:
-                fig_path = os.path.join(output_dir, f'grf_money_shot_update_{update}.png')
+                fig_path = os.path.join(output_dir, f'money_shot_update_{update}.png')
                 generate_money_shot_figure(
                     timeline_data,
                     agents,
                     save_path=fig_path,
-                    title=f'GRF Money Shot (Update {update}, {args.mode.upper()})',
+                    title=f'ETD-MAPPO Money Shot (Update {update}, {args.mode.upper()})',
                 )
 
-            # Run baseline comparison
+            # Run baseline comparison every eval_interval * 2
             if update % (args.eval_interval * 2) == 0 and args.mode == 'etd':
                 print('\n[*] Running Baseline Comparison...')
                 comparison_summary, _ = run_baseline_comparison(
@@ -364,13 +350,11 @@ def main():
                 )
                 log_comparison_table(comparison_summary, update)
 
-        # Brief progress update
         if update % 50 == 0:
             print(
-                f'--- GRF Update {update}/{num_updates} | FLOP: {flop_reduction_pct:.1f}% | Entropy: {avg_entropy:.3f} | Episodes: {episodes_completed} | Reward: {episode_reward_sum:.3f} ---'
+                f'--- LBF Update {update}/{num_updates} | FLOP: {flop_reduction_pct:.1f}% | Entropy: {avg_entropy:.3f} | Episodes: {episodes_completed} | Reward: {episode_reward_sum:.3f} ---'
             )
 
-    # Final evaluation
     print(f'\n{"=" * 70}')
     print('FINAL EVALUATION')
     print(f'{"=" * 70}')
@@ -380,17 +364,19 @@ def main():
     )
 
     if args.save_figures:
-        fig_path = os.path.join(output_dir, f'grf_money_shot_final_{args.mode}.png')
+        fig_path = os.path.join(output_dir, f'money_shot_final_{args.mode}.png')
         generate_money_shot_figure(
-            timeline_data, agents, save_path=fig_path, title=f'GRF Final Money Shot ({args.mode.upper()})'
+            timeline_data, agents, save_path=fig_path, title=f'ETD-MAPPO Final Money Shot ({args.mode.upper()})'
         )
 
+    # Final baseline comparison
     if args.mode == 'etd':
         comparison_summary, _ = run_baseline_comparison(
             env, actors, device, hidden_size=hidden_size, num_eval_episodes=20
         )
         log_comparison_table(comparison_summary, update_num='Final')
 
+    # Final temporal specialization
     log_temporal_specialization(tracker, 'Final')
 
     print('\n[*] Training Complete!')
