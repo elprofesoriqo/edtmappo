@@ -32,6 +32,32 @@ class AdaptiveEntropyScheduler:
         return current
 
 
+class AdaptiveCriticDisparityScheduler:
+    """
+    Adaptive Critic Disparity  (tau_v) Threshold Scheduler.
+
+    Linearly anneals the tau_v threshold from an initial high value (allowing
+    sleep when critics generally agree) to a final lower value (forcing
+    them to agree much more strictly) to prevent policy collapse into sleep.
+    """
+
+    def __init__(self, initial_threshold=0.1, final_threshold=0.01, total_updates=1000):
+        self.initial_threshold = initial_threshold
+        self.final_threshold = final_threshold
+        self.total_updates = total_updates
+        self.current_update = 0
+
+    def step(self):
+        """Advance the scheduler by one step."""
+        self.current_update += 1
+
+    def get_threshold(self):
+        """Get the current tau_v threshold."""
+        fraction = min(1.0, self.current_update / self.total_updates)
+        current = self.initial_threshold + fraction * (self.final_threshold - self.initial_threshold)
+        return current
+
+
 class PerformanceTracker:
     """
     Performance tracker for ETD-MAPPO experiments.
@@ -155,7 +181,7 @@ class PerformanceTracker:
         return summary
 
 
-def log_episode_timeline(env, actors, entropy_threshold, max_sleep_ticks, device, hidden_size=64, episode='Eval'):
+def log_episode_timeline(env, actors, critics, entropy_threshold, tau_v, max_sleep_ticks, device, hidden_size=64, episode='Eval'):
     """
     Runs a deterministic episode and records tick rates and entropy for
     every frame to visualize the dynamic frame-skipping behavior.
@@ -163,13 +189,17 @@ def log_episode_timeline(env, actors, entropy_threshold, max_sleep_ticks, device
     obs_dict, global_state, _ = env.reset()
     agents = env.possible_agents
 
+    global_obs_dim = global_state.shape[0]
+
     timeline_data = {agent: {'tick_rate': [], 'entropy': [], 'action': [], 'reward': []} for agent in agents}
 
     max_frames = 150
 
     hidden_states = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+    critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
 
     next_obs = {a: torch.tensor(obs_dict[a], dtype=torch.float32).to(device) for a in agents}
+    global_obs = torch.tensor(global_state, dtype=torch.float32).to(device)
 
     total_reward = 0.0
 
@@ -194,16 +224,23 @@ def log_episode_timeline(env, actors, entropy_threshold, max_sleep_ticks, device
                     sleep_ticks_dict[a] = 0
                     continue
 
+                # Critic Pass
+                val1, val2, new_c_hidden = critics[a](global_obs.unsqueeze(0), critic_hidden[a], active_mask)
+                critic_diff = torch.abs(val1 - val2).item()
+
                 # Agent is awake
                 action, _, entropy, sleep_ticks, new_hidden = actors[a].get_action_and_sleep_ticks(
                     next_obs[a].unsqueeze(0),
                     hidden_states[a],
                     active_mask,
                     entropy_threshold=entropy_threshold,
+                    tau_v=tau_v,
+                    critic_diff=critic_diff,
                     max_sleep_ticks=max_sleep_ticks,
                 )
 
                 hidden_states[a] = new_hidden
+                critic_hidden[a] = new_c_hidden
 
                 timeline_data[a]['tick_rate'].append(1.0)
                 timeline_data[a]['entropy'].append(entropy.item())
@@ -215,6 +252,8 @@ def log_episode_timeline(env, actors, entropy_threshold, max_sleep_ticks, device
             next_obs_dict, next_global_state, rewards_dict, dones_dict, _, active_masks = env.step(
                 actions_dict, sleep_ticks_dict
             )
+
+            global_obs = torch.tensor(next_global_state, dtype=torch.float32).to(device)
 
             for a in agents:
                 reward = rewards_dict.get(a, 0.0)
@@ -371,7 +410,7 @@ def log_temporal_specialization(tracker, update_num):
         )
 
 
-def run_evaluation_episode(env, actors, entropy_threshold, max_sleep_ticks, device, hidden_size=64, deterministic=True):
+def run_evaluation_episode(env, actors, critics, entropy_threshold, tau_v, max_sleep_ticks, device, hidden_size=64, deterministic=True):
     """
     Run a single evaluation episode.
     """
@@ -379,7 +418,10 @@ def run_evaluation_episode(env, actors, entropy_threshold, max_sleep_ticks, devi
     agents = env.possible_agents
 
     hidden_states = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+    critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
+
     next_obs = {a: torch.tensor(obs_dict[a], dtype=torch.float32).to(device) for a in agents}
+    global_obs = torch.tensor(global_state, dtype=torch.float32).to(device)
 
     total_reward = 0.0
     agent_rewards = {a: 0.0 for a in agents}
@@ -403,15 +445,22 @@ def run_evaluation_episode(env, actors, entropy_threshold, max_sleep_ticks, devi
                     agent_sleeps[a] += 1
                     continue
 
+                # Critic pass
+                val1, val2, new_c_hidden = critics[a](global_obs.unsqueeze(0), critic_hidden[a], active_mask)
+                critic_diff = torch.abs(val1 - val2).item()
+
                 action, _, entropy, sleep_ticks, new_hidden = actors[a].get_action_and_sleep_ticks(
                     next_obs[a].unsqueeze(0),
                     hidden_states[a],
                     active_mask,
                     entropy_threshold=entropy_threshold,
+                    tau_v=tau_v,
+                    critic_diff=critic_diff,
                     max_sleep_ticks=max_sleep_ticks,
                 )
 
                 hidden_states[a] = new_hidden
+                critic_hidden[a] = new_c_hidden
 
                 if deterministic:
                     logits, _ = actors[a].forward(next_obs[a].unsqueeze(0), hidden_states[a], active_mask)
@@ -420,7 +469,8 @@ def run_evaluation_episode(env, actors, entropy_threshold, max_sleep_ticks, devi
                 actions_dict[a] = action.item() if isinstance(action, torch.Tensor) else action
                 sleep_ticks_dict[a] = sleep_ticks.item() if isinstance(sleep_ticks, torch.Tensor) else sleep_ticks
 
-            next_obs_dict, _, rewards_dict, dones_dict, _, _ = env.step(actions_dict, sleep_ticks_dict)
+            next_obs_dict, next_global_state, rewards_dict, dones_dict, _, _ = env.step(actions_dict, sleep_ticks_dict)
+            global_obs = torch.tensor(next_global_state, dtype=torch.float32).to(device)
 
             episode_length += 1
 
@@ -446,7 +496,7 @@ def run_evaluation_episode(env, actors, entropy_threshold, max_sleep_ticks, devi
     }
 
 
-def run_baseline_comparison(env, actors, device, hidden_size=64, num_eval_episodes=10):
+def run_baseline_comparison(env, actors, critics, tau_v, device, hidden_size=64, num_eval_episodes=10):
     """
     Compare ETD, Vanilla, and Fixed-Skip modes.
     """
@@ -462,7 +512,7 @@ def run_baseline_comparison(env, actors, device, hidden_size=64, num_eval_episod
     for _ep in range(num_eval_episodes):
         # ETD Mode
         etd_result = run_evaluation_episode(
-            env, actors, entropy_threshold=1.5, max_sleep_ticks=max_sleep, device=device, hidden_size=hidden_size
+            env, actors, critics, entropy_threshold=1.5, tau_v=tau_v, max_sleep_ticks=max_sleep, device=device, hidden_size=hidden_size
         )
         results['etd']['rewards'].append(etd_result['total_reward'])
         results['etd']['sleep_rates'].append(np.mean(list(etd_result['agent_sleep_rates'].values())))
@@ -470,7 +520,7 @@ def run_baseline_comparison(env, actors, device, hidden_size=64, num_eval_episod
 
         # Vanilla Mode
         vanilla_result = run_evaluation_episode(
-            env, actors, entropy_threshold=-1.0, max_sleep_ticks=0, device=device, hidden_size=hidden_size
+            env, actors, critics, entropy_threshold=-1.0, tau_v=tau_v, max_sleep_ticks=0, device=device, hidden_size=hidden_size
         )
         results['vanilla']['rewards'].append(vanilla_result['total_reward'])
         results['vanilla']['sleep_rates'].append(0.0)
@@ -478,7 +528,7 @@ def run_baseline_comparison(env, actors, device, hidden_size=64, num_eval_episod
 
         # Fixed-Skip Mode
         fixed_result = run_evaluation_episode(
-            env, actors, entropy_threshold=999.0, max_sleep_ticks=max_sleep, device=device, hidden_size=hidden_size
+            env, actors, critics, entropy_threshold=999.0, tau_v=tau_v, max_sleep_ticks=max_sleep, device=device, hidden_size=hidden_size
         )
         results['fixed_skip']['rewards'].append(fixed_result['total_reward'])
         results['fixed_skip']['sleep_rates'].append(np.mean(list(fixed_result['agent_sleep_rates'].values())))
