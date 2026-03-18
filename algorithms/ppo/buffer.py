@@ -87,7 +87,7 @@ class AsynchronousRolloutBuffer:
             # Calculate SMDP-aligned delta bridging the gap
             gamma_gap = gamma ** current_gap
             delta = r_effective + gamma_gap * next_valid_value * next_valid_nonterminal - self.values[t]
-            
+
             # Formulate Advantage
             # GAE bridges across the gap: (gamma * gae_lambda) ** current_gap
             gae_decay = (gamma * gae_lambda) ** current_gap

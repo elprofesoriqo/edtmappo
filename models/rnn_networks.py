@@ -179,7 +179,7 @@ class AsynchronousGRUCritic(nn.Module):
 
     def __init__(self, global_obs_dim, hidden_size=64):
         super().__init__()
-        
+
         # Critic 1
         self.fc1_1 = layer_init(nn.Linear(global_obs_dim, hidden_size))
         self.gru_1 = nn.GRUCell(hidden_size, hidden_size)
@@ -223,7 +223,7 @@ class AsynchronousGRUCritic(nn.Module):
 
         # Critic 2 Flow
         x2 = torch.tanh(self.fc1_2(global_obs))
-        
+
         new_h2 = h2.clone()
         if masks_bool.dim() == 0:
             if masks_bool.item():

@@ -8,13 +8,13 @@ try:
             obs = _original_reset(self)
             return obs, {}
         football_env_core.FootballEnv.reset = _patched_reset
-        
+
         _original_step = football_env_core.FootballEnv.step
         def _patched_step(self, action):
             obs, reward, done, info = _original_step(self, action)
             return obs, reward, done, False, info
         football_env_core.FootballEnv.step = _patched_step
-        
+
         football_env_core.FootballEnv._is_patched = True
 
     GFOOTBALL_AVAILABLE = True

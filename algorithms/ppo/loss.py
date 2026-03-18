@@ -27,7 +27,7 @@ def compute_masked_ppo_loss(
 
     v_loss2 = 0.5 * ((values2 - returns) ** 2)
     v_loss2 = v_loss2 * active_masks
-    
+
     v_loss = v_loss1 + v_loss2
 
     # Entropy Masking
