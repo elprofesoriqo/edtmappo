@@ -26,6 +26,7 @@ from algorithms.ppo.loss import compute_masked_ppo_loss
 from envs.mpe_wrapper import AsynchronousMPEWrapper
 from models.rnn_networks import AsynchronousGRUActor, AsynchronousGRUCritic
 from utils.wandb_logger import (
+    AdaptiveCriticDisparityScheduler,
     AdaptiveEntropyScheduler,
     PerformanceTracker,
     generate_money_shot_figure,
@@ -40,6 +41,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='ETD-MAPPO MPE Comprehensive Evaluator')
     parser.add_argument('--mode', type=str, default='etd', choices=['etd', 'vanilla', 'fixed_skip'])
     parser.add_argument('--fixed_skip_amount', type=int, default=3)
+    parser.add_argument('--tau_v', type=float, default=0.1, help='Critic disparity threshold for Dual-Gate ETD')
     parser.add_argument('--num_updates', type=int, default=5000)
     parser.add_argument('--eval_interval', type=int, default=500, help='Run evaluation every N updates')
     parser.add_argument('--save_figures', action='store_true', help='Save Money Shot figures locally')
@@ -89,13 +91,22 @@ def main():
         entropy_scheduler = AdaptiveEntropyScheduler(
             initial_threshold=-1.0, final_threshold=-1.0, total_updates=num_updates
         )
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(
+            initial_threshold=999.0, final_threshold=999.0, total_updates=num_updates
+        )
     elif args.mode == 'fixed_skip':
         entropy_scheduler = AdaptiveEntropyScheduler(
+            initial_threshold=999.0, final_threshold=999.0, total_updates=num_updates
+        )
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(
             initial_threshold=999.0, final_threshold=999.0, total_updates=num_updates
         )
     else:
         entropy_scheduler = AdaptiveEntropyScheduler(
             initial_threshold=0.5, final_threshold=1.65, total_updates=num_updates
+        )
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(
+            initial_threshold=args.tau_v, final_threshold=args.tau_v * 0.1, total_updates=num_updates
         )
 
     # Network & Buffer Initialization
@@ -133,9 +144,12 @@ def main():
     batch_global_obs = torch.zeros((num_steps, global_obs_dim)).to(device)
 
     # Training loop
+    active_masks_prev = {a: 1.0 for a in agents}
     for update in range(1, num_updates + 1):
         current_threshold = entropy_scheduler.get_threshold()
+        current_tau_v = tau_v_scheduler.get_threshold()
         entropy_scheduler.step()
+        tau_v_scheduler.step()
 
         # Reset buffers
         for a in agents:
@@ -146,13 +160,14 @@ def main():
         next_obs = {a: torch.tensor(obs[a], dtype=torch.float32).to(device) for a in agents}
 
         actor_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
-        critic_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+        critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
 
         # Tracking variables
         saved_inferences = 0
         total_evaluations = 0
         episode_rewards_sum = {a: 0.0 for a in agents}
         episodes_completed = 0
+        active_masks_prev = {a: 1.0 for a in agents}
 
         # Rollout phase
         for step in range(num_steps):
@@ -175,22 +190,25 @@ def main():
 
             with torch.no_grad():
                 for a in agents:
-                    active_mask_tensor = torch.ones((1, 1)).to(device)
+                    active_mask_tensor = torch.tensor([[active_masks_prev[a]]]).to(device)
+
+                    value1, value2, new_critic_h = critics[a](global_obs.unsqueeze(0), critic_hidden[a], active_mask_tensor)
+                    critic_diff_val = torch.abs(value1 - value2).item()
 
                     action, log_prob, entropy, sleep_ticks, new_actor_h = actors[a].get_action_and_sleep_ticks(
                         next_obs[a].unsqueeze(0),
                         actor_hidden[a],
                         active_mask_tensor,
                         entropy_threshold=current_threshold,
+                        tau_v=current_tau_v,
+                        critic_diff=critic_diff_val,
                         max_sleep_ticks=max_sleep_ticks,
                     )
-
-                    value, new_critic_h = critics[a](global_obs.unsqueeze(0), critic_hidden[a], active_mask_tensor)
 
                     actor_hidden[a] = new_actor_h
                     critic_hidden[a] = new_critic_h
 
-                    step_values[a] = value.squeeze()
+                    step_values[a] = value1.squeeze()
                     step_logprobs[a] = log_prob.squeeze()
                     step_entropies[a] = entropy.item()
 
@@ -210,6 +228,9 @@ def main():
             next_obs_dict, next_global_state, rewards_dict, dones_dict, _, active_masks = env.step(
                 actions_dict, sleep_ticks_dict
             )
+
+            # Store masks for the next frame's asynchronous GRU representation skip
+            active_masks_prev = {a: active_masks.get(a, 1.0) for a in agents}
 
             # Track performance
             tracker.step(rewards_dict, active_masks, step_entropies)
@@ -250,17 +271,18 @@ def main():
                 obs, _, _ = env.reset()
                 next_obs = {a: torch.tensor(obs[a], dtype=torch.float32).to(device) for a in agents}
                 actor_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
-                critic_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+                critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
+                active_masks_prev = {a: 1.0 for a in agents}
 
         # PPO Update phase
         with torch.no_grad():
             global_obs = torch.cat([next_obs[a] for a in sorted(agents)], dim=-1)
             for a in agents:
                 dummy_mask = torch.ones((1, 1)).to(device)
-                next_value, _ = critics[a](global_obs.unsqueeze(0), critic_hidden[a], dummy_mask)
-                next_value = next_value.squeeze()
+                next_value1, next_value2, _ = critics[a](global_obs.unsqueeze(0), critic_hidden[a], dummy_mask)
+                next_value1 = next_value1.squeeze()
 
-                advantages, returns = buffers[a].compute_gae(next_value, buffers[a].dones[-1], gamma, gae_lambda)
+                advantages, returns = buffers[a].compute_gae(next_value1, buffers[a].dones[-1], gamma, gae_lambda)
 
                 b_obs = buffers[a].obs
                 b_logprobs = buffers[a].logprobs
@@ -268,21 +290,40 @@ def main():
                 b_masks = buffers[a].active_masks
 
                 with torch.enable_grad():
-                    b_hidden_a = torch.zeros((num_steps, hidden_size)).to(device)
+                    # BPTT: unroll GRU over time
                     b_active_mask_batch = b_masks.unsqueeze(-1)
 
-                    _, newlogprob, entropy, _, _ = actors[a].get_action_and_sleep_ticks(
-                        b_obs, b_hidden_a, b_active_mask_batch, current_threshold, max_sleep_ticks, action=b_actions
-                    )
+                    b_hidden_c = (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device))
+                    b_hidden_a = torch.zeros((1, hidden_size)).to(device)
 
-                    b_hidden_c = torch.zeros((num_steps, hidden_size)).to(device)
-                    newvalue, _ = critics[a](batch_global_obs, b_hidden_c, b_active_mask_batch)
-                    newvalue = newvalue.squeeze()
+                    v1_list, v2_list, logits_list = [], [], []
+
+                    for t in range(num_steps):
+                        # Critic forward
+                        v1_t, v2_t, b_hidden_c = critics[a](batch_global_obs[t].unsqueeze(0), b_hidden_c, b_active_mask_batch[t].unsqueeze(0))
+
+                        # Actor forward (logits only, skip sleep ticks overhead)
+                        logits_t, b_hidden_a = actors[a](b_obs[t].unsqueeze(0), b_hidden_a, b_active_mask_batch[t].unsqueeze(0))
+
+                        v1_list.append(v1_t)
+                        v2_list.append(v2_t)
+                        logits_list.append(logits_t)
+
+                    newvalue1 = torch.cat(v1_list).squeeze()
+                    newvalue2 = torch.cat(v2_list).squeeze()
+
+                    # Vectorized action distribution for the whole sequence
+                    logits_seq = torch.cat(logits_list).squeeze(1)
+                    from torch.distributions.categorical import Categorical
+                    dist = Categorical(logits=logits_seq)
+                    newlogprob = dist.log_prob(b_actions.squeeze(-1)).squeeze()
+                    entropy = dist.entropy().mean()
 
                     loss, pg_loss, v_loss, ent_mean = compute_masked_ppo_loss(
                         newlogprob,
                         b_logprobs,
-                        newvalue,
+                        newvalue1,
+                        newvalue2,
                         returns,
                         advantages,
                         b_masks,
@@ -312,6 +353,7 @@ def main():
             'compute/FLOP_reduction_pct': flop_reduction_pct,
             'compute/saved_inferences': saved_inferences,
             'dynamics/entropy_threshold': current_threshold,
+            'dynamics/tau_v_threshold': current_tau_v,
             'dynamics/avg_policy_entropy': avg_entropy,
             'training/episodes_completed': episodes_completed,
             'training/episode_reward_this_update': episode_reward_sum,
@@ -332,6 +374,7 @@ def main():
             print(f'{"=" * 70}')
             print(f'  FLOP Reduction: {flop_reduction_pct:.1f}%')
             print(f'  Entropy Threshold: {current_threshold:.3f}')
+            print(f'  Tau V Threshold: {current_tau_v:.3f}')
             print(f'  Avg Policy Entropy: {avg_entropy:.3f}')
 
             if 'performance/win_rate' in perf_metrics:
@@ -347,7 +390,9 @@ def main():
             timeline_data, total_reward = log_episode_timeline(
                 env,
                 actors,
+                critics,
                 current_threshold,
+                current_tau_v,
                 max_sleep_ticks,
                 device,
                 hidden_size=hidden_size,
@@ -368,7 +413,7 @@ def main():
             if update % (args.eval_interval * 2) == 0 and args.mode == 'etd':
                 print('\n[*] Running Baseline Comparison...')
                 comparison_summary, _ = run_baseline_comparison(
-                    env, actors, device, hidden_size=hidden_size, num_eval_episodes=10
+                    env, actors, critics, current_tau_v, device, hidden_size=hidden_size, num_eval_episodes=10
                 )
                 log_comparison_table(comparison_summary, update)
 
@@ -385,7 +430,7 @@ def main():
 
     # Generate final Money Shot
     timeline_data, total_reward = log_episode_timeline(
-        env, actors, current_threshold, max_sleep_ticks, device, hidden_size=hidden_size, episode='Final'
+        env, actors, critics, current_threshold, current_tau_v, max_sleep_ticks, device, hidden_size=hidden_size, episode='Final'
     )
 
     if args.save_figures:
@@ -397,7 +442,7 @@ def main():
     # Final baseline comparison
     if args.mode == 'etd':
         comparison_summary, _ = run_baseline_comparison(
-            env, actors, device, hidden_size=hidden_size, num_eval_episodes=20
+            env, actors, critics, current_tau_v, device, hidden_size=hidden_size, num_eval_episodes=20
         )
         log_comparison_table(comparison_summary, update_num='Final')
 

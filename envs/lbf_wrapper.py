@@ -13,7 +13,7 @@ class AsynchronousLBFWrapper:
 
     def __init__(self, env_id='Foraging-8x8-2p-2f-v3'):
         # LBF registers itself into standard gym
-        self.env = gym.make(env_id)
+        self.env = gym.make(env_id, disable_env_checker=True)
 
         self.n_agents = len(self.env.observation_space)
         self.possible_agents = [f'agent_{i}' for i in range(self.n_agents)]

@@ -2,7 +2,7 @@ import torch
 
 
 def compute_masked_ppo_loss(
-    logprobs, old_logprobs, values, returns, advantages, active_masks, clip_coef, vf_coef, ent_coef, entropy
+    logprobs, old_logprobs, values1, values2, returns, advantages, active_masks, clip_coef, vf_coef, ent_coef, entropy
 ):
     """
     Compute PPO loss with Asynchronous Gradient Masking.
@@ -21,9 +21,14 @@ def compute_masked_ppo_loss(
     # Asynchronous Gradient Masking
     pg_loss = pg_loss * active_masks
 
-    # Value Loss (Critic)
-    v_loss = 0.5 * ((values - returns) ** 2)
-    v_loss = v_loss * active_masks
+    # Value Loss (Twin Critics)
+    v_loss1 = 0.5 * ((values1 - returns) ** 2)
+    v_loss1 = v_loss1 * active_masks
+
+    v_loss2 = 0.5 * ((values2 - returns) ** 2)
+    v_loss2 = v_loss2 * active_masks
+
+    v_loss = v_loss1 + v_loss2
 
     # Entropy Masking
     entropy_masked = entropy * active_masks

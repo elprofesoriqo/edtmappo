@@ -24,6 +24,7 @@ from algorithms.ppo.loss import compute_masked_ppo_loss
 from envs.mpe_wrapper import AsynchronousMPEWrapper
 from models.rnn_networks import AsynchronousGRUActor, AsynchronousGRUCritic
 from utils.wandb_logger import (
+    AdaptiveCriticDisparityScheduler,
     AdaptiveEntropyScheduler,
     PerformanceTracker,
     generate_money_shot_figure,
@@ -34,6 +35,7 @@ from utils.wandb_logger import (
 def parse_args():
     parser = argparse.ArgumentParser(description='ETD-MAPPO Navigation Proof of Concept')
     parser.add_argument('--mode', type=str, default='etd', choices=['etd', 'vanilla', 'fixed_skip'])
+    parser.add_argument('--tau_v', type=float, default=0.1, help='Critic disparity threshold for Dual-Gate ETD')
     parser.add_argument('--num_updates', type=int, default=2000, help='Short training for simple task')
     parser.add_argument('--eval_interval', type=int, default=200)
     parser.add_argument('--save_figures', action='store_true')
@@ -66,12 +68,17 @@ def main():
     # Entropy Scheduler: Start strictly awake to learn navigation, then allow sleep
     if args.mode == 'vanilla':
         entropy_scheduler = AdaptiveEntropyScheduler(-1.0, -1.0, num_updates)
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(999.0, 999.0, num_updates)
     elif args.mode == 'fixed_skip':
         entropy_scheduler = AdaptiveEntropyScheduler(999.0, 999.0, num_updates)
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(999.0, 999.0, num_updates)
     else:
         # ETD: Ramp up threshold faster since this is an easier task
         entropy_scheduler = AdaptiveEntropyScheduler(
             initial_threshold=0.3, final_threshold=1.4, total_updates=num_updates
+        )
+        tau_v_scheduler = AdaptiveCriticDisparityScheduler(
+            initial_threshold=args.tau_v, final_threshold=args.tau_v * 0.1, total_updates=num_updates
         )
 
     # Init Networks
@@ -99,9 +106,12 @@ def main():
     batch_global_obs = torch.zeros((num_steps, global_obs_dim)).to(device)
 
     # Training Loop
+    active_masks_prev = {a: 1.0 for a in agents}
     for update in range(1, num_updates + 1):
         current_threshold = entropy_scheduler.get_threshold()
+        current_tau_v = tau_v_scheduler.get_threshold()
         entropy_scheduler.step()
+        tau_v_scheduler.step()
 
         for a in agents:
             buffers[a].reset()
@@ -110,11 +120,12 @@ def main():
         next_obs = {a: torch.tensor(obs[a], dtype=torch.float32).to(device) for a in agents}
 
         actor_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
-        critic_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+        critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
 
         saved_inferences = 0
         total_evaluations = 0
         episode_rewards = {a: 0.0 for a in agents}
+        active_masks_prev = {a: 1.0 for a in agents}
 
         # Rollout
         for step in range(num_steps):
@@ -130,15 +141,17 @@ def main():
 
             with torch.no_grad():
                 for a in agents:
-                    mask = torch.ones((1, 1)).to(device)
+                    mask = torch.tensor([[active_masks_prev[a]]]).to(device)
+                    val1, val2, c_h = critics[a](global_obs.unsqueeze(0), critic_hidden[a], mask)
+                    c_diff = torch.abs(val1 - val2).item()
+
                     act, lp, ent, sleep, h = actors[a].get_action_and_sleep_ticks(
-                        next_obs[a].unsqueeze(0), actor_hidden[a], mask, current_threshold, max_sleep_ticks
+                        next_obs[a].unsqueeze(0), actor_hidden[a], mask, current_threshold, current_tau_v, c_diff, max_sleep_ticks
                     )
-                    val, c_h = critics[a](global_obs.unsqueeze(0), critic_hidden[a], mask)
 
                     actor_hidden[a] = h
                     critic_hidden[a] = c_h
-                    vals[a] = val.squeeze()
+                    vals[a] = val1.squeeze()
                     logprobs[a] = lp.squeeze()
                     entropies[a] = ent.item()
 
@@ -154,6 +167,7 @@ def main():
 
             # Step
             next_obs_dict, _, rewards, dones, _, active_masks = env.step(actions, sleeps)
+            active_masks_prev = {a: active_masks.get(a, 1.0) for a in agents}
             tracker.step(rewards, active_masks, entropies)
 
             for a in agents:
@@ -185,38 +199,54 @@ def main():
                 obs, _, _ = env.reset()
                 next_obs = {a: torch.tensor(obs[a], dtype=torch.float32).to(device) for a in agents}
                 actor_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
-                critic_hidden = {a: torch.zeros((1, hidden_size)).to(device) for a in agents}
+                critic_hidden = {a: (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device)) for a in agents}
                 episode_rewards = {a: 0.0 for a in agents}
+                active_masks_prev = {a: 1.0 for a in agents}
 
         # Update
         with torch.no_grad():
             global_obs = torch.cat([next_obs[a] for a in sorted(agents)], dim=-1)
             for a in agents:
                 mask = torch.ones((1, 1)).to(device)
-                next_v, _ = critics[a](global_obs.unsqueeze(0), critic_hidden[a], mask)
-                adv, ret = buffers[a].compute_gae(next_v.squeeze(), buffers[a].dones[-1], gamma, 0.95)
+                next_v1, next_v2, _ = critics[a](global_obs.unsqueeze(0), critic_hidden[a], mask)
+                adv, ret = buffers[a].compute_gae(next_v1.squeeze(), buffers[a].dones[-1], gamma, 0.95)
 
                 # PPO update block (simplified for brevity, identical to other scripts)
                 b_obs, b_act, b_lp = buffers[a].obs, buffers[a].actions, buffers[a].logprobs
                 b_mask = buffers[a].active_masks
 
                 with torch.enable_grad():
-                    # Re-eval actor
-                    _, new_lp, ent, _, _ = actors[a].get_action_and_sleep_ticks(
-                        b_obs,
-                        torch.zeros((num_steps, hidden_size)).to(device),
-                        b_mask.unsqueeze(-1),
-                        current_threshold,
-                        max_sleep_ticks,
-                        action=b_act,
-                    )
-                    # Re-eval critic
-                    new_v, _ = critics[a](
-                        batch_global_obs, torch.zeros((num_steps, hidden_size)).to(device), b_mask.unsqueeze(-1)
-                    )
+                    # BPTT: unroll GRU over time
+                    b_active_mask_batch = b_mask.unsqueeze(-1)
+
+                    b_hidden_c = (torch.zeros((1, hidden_size)).to(device), torch.zeros((1, hidden_size)).to(device))
+                    b_hidden_a = torch.zeros((1, hidden_size)).to(device)
+
+                    v1_list, v2_list, logits_list = [], [], []
+
+                    for t in range(num_steps):
+                        # Critic forward
+                        v1_t, v2_t, b_hidden_c = critics[a](batch_global_obs[t].unsqueeze(0), b_hidden_c, b_active_mask_batch[t].unsqueeze(0))
+
+                        # Actor forward (logits only, skip sleep ticks overhead)
+                        logits_t, b_hidden_a = actors[a](b_obs[t].unsqueeze(0), b_hidden_a, b_active_mask_batch[t].unsqueeze(0))
+
+                        v1_list.append(v1_t)
+                        v2_list.append(v2_t)
+                        logits_list.append(logits_t)
+
+                    new_v1 = torch.cat(v1_list).squeeze()
+                    new_v2 = torch.cat(v2_list).squeeze()
+
+                    # Vectorized action distribution for the whole sequence
+                    logits_seq = torch.cat(logits_list).squeeze(1)
+                    from torch.distributions.categorical import Categorical
+                    dist = Categorical(logits=logits_seq)
+                    new_lp = dist.log_prob(b_act.squeeze(-1)).squeeze()
+                    ent = dist.entropy().mean()
 
                     loss, _, _, _ = compute_masked_ppo_loss(
-                        new_lp, b_lp, new_v.squeeze(), ret, adv, b_mask, clip_coef, 0.5, 0.01, ent
+                        new_lp, b_lp, new_v1, new_v2, ret, adv, b_mask, clip_coef, 0.5, 0.01, ent
                     )
                     optimizers[a].zero_grad()
                     loss.backward()
@@ -227,7 +257,7 @@ def main():
         flop_pct = (saved_inferences / total_evaluations) * 100
         metrics = tracker.get_metrics()
 
-        log_dict = {'compute/FLOP_reduction_pct': flop_pct, 'dynamics/entropy_threshold': current_threshold, **metrics}
+        log_dict = {'compute/FLOP_reduction_pct': flop_pct, 'dynamics/entropy_threshold': current_threshold, 'dynamics/tau_v_threshold': current_tau_v, **metrics}
         wandb.log(log_dict, step=update)
 
         if update % args.eval_interval == 0:
@@ -237,7 +267,7 @@ def main():
             if args.mode == 'etd' and args.save_figures:
                 # Money Shot
                 timeline_data, _ = log_episode_timeline(
-                    env, actors, current_threshold, max_sleep_ticks, device, hidden_size, episode=f'Update{update}'
+                    env, actors, critics, current_threshold, current_tau_v, max_sleep_ticks, device, hidden_size, episode=f'Update{update}'
                 )
                 generate_money_shot_figure(
                     timeline_data, agents, save_path=os.path.join(output_dir, f'nav_money_shot_{update}.png')

@@ -138,10 +138,10 @@ class AsynchronousGRUActor(nn.Module):
         return logits, new_hidden
 
     def get_action_and_sleep_ticks(
-        self, x, hidden_states, active_masks, entropy_threshold, max_sleep_ticks=3, action=None
+        self, x, hidden_states, active_masks, entropy_threshold, tau_v, critic_diff, max_sleep_ticks=3, action=None
     ):
         """
-        Sample action and determine sleep duration with recurrent state.
+        Sample action and determine sleep duration with recurrent state using the Dual-Gate trigger.
         """
         logits, new_hidden = self.forward(x, hidden_states, active_masks)
         dist = Categorical(logits=logits)
@@ -157,8 +157,13 @@ class AsynchronousGRUActor(nn.Module):
         else:
             max_sleep_ticks_tensor = max_sleep_ticks.to(x.device)
 
+        # Dual-Gate Logic: Sleep ONLY if entropy is low AND critics agree
+        entropy_condition = entropy <= entropy_threshold
+        critic_condition = critic_diff <= tau_v
+        sleep_condition = entropy_condition & critic_condition
+
         sleep_ticks = torch.where(
-            entropy <= entropy_threshold, max_sleep_ticks_tensor, torch.zeros_like(max_sleep_ticks_tensor)
+            sleep_condition, max_sleep_ticks_tensor, torch.zeros_like(max_sleep_ticks_tensor)
         )
 
         return action, log_prob, entropy, sleep_ticks, new_hidden
@@ -166,38 +171,65 @@ class AsynchronousGRUActor(nn.Module):
 
 class AsynchronousGRUCritic(nn.Module):
     """
-    Recurrent Centralized Critic Network.
+    Recurrent Centralized Twin-Critic Network.
 
     Evaluates global state with support for asynchronous hidden state updates.
+    Contains two independent critic streams (V1 and V2) to estimate epistemic uncertainty.
     """
 
     def __init__(self, global_obs_dim, hidden_size=64):
         super().__init__()
-        self.fc1 = layer_init(nn.Linear(global_obs_dim, hidden_size))
 
-        self.gru = nn.GRUCell(hidden_size, hidden_size)
-        for name, param in self.gru.named_parameters():
+        # Critic 1
+        self.fc1_1 = layer_init(nn.Linear(global_obs_dim, hidden_size))
+        self.gru_1 = nn.GRUCell(hidden_size, hidden_size)
+        for name, param in self.gru_1.named_parameters():
             if 'bias' in name:
                 nn.init.constant_(param, 0)
             elif 'weight' in name:
                 nn.init.orthogonal_(param, 1.0)
+        self.fc2_1 = layer_init(nn.Linear(hidden_size, 1), std=1.0)
 
-        self.fc2 = layer_init(nn.Linear(hidden_size, 1), std=1.0)
+        # Critic 2
+        self.fc1_2 = layer_init(nn.Linear(global_obs_dim, hidden_size))
+        self.gru_2 = nn.GRUCell(hidden_size, hidden_size)
+        for name, param in self.gru_2.named_parameters():
+            if 'bias' in name:
+                nn.init.constant_(param, 0)
+            elif 'weight' in name:
+                nn.init.orthogonal_(param, 1.0)
+        self.fc2_2 = layer_init(nn.Linear(hidden_size, 1), std=1.0)
 
     def forward(self, global_obs, hidden_states, active_masks):
         """
-        Forward pass with selective GRU updates.
+        Forward pass with selective GRU updates for both critics.
+        Expects hidden_states to be shape [..., 2*hidden_size] conceptually,
+        but implementations usually treat it as a tuple (h1, h2) or stack.
+        For simplicity, we assume hidden_states is a tuple (h1, h2).
         """
-        x = torch.tanh(self.fc1(global_obs))
+        h1, h2 = hidden_states
+
+        # Critic 1 Flow
+        x1 = torch.tanh(self.fc1_1(global_obs))
         masks_bool = active_masks.squeeze().bool()
 
-        new_hidden = hidden_states.clone()
-
+        new_h1 = h1.clone()
         if masks_bool.dim() == 0:
             if masks_bool.item():
-                new_hidden = self.gru(x, hidden_states)
+                new_h1 = self.gru_1(x1, h1)
         elif masks_bool.any():
-            new_hidden[masks_bool] = self.gru(x[masks_bool], hidden_states[masks_bool])
+            new_h1[masks_bool] = self.gru_1(x1[masks_bool], h1[masks_bool])
+        value1 = self.fc2_1(new_h1)
 
-        value = self.fc2(new_hidden)
-        return value, new_hidden
+        # Critic 2 Flow
+        x2 = torch.tanh(self.fc1_2(global_obs))
+
+        new_h2 = h2.clone()
+        if masks_bool.dim() == 0:
+            if masks_bool.item():
+                new_h2 = self.gru_2(x2, h2)
+        elif masks_bool.any():
+            new_h2[masks_bool] = self.gru_2(x2[masks_bool], h2[masks_bool])
+        value2 = self.fc2_2(new_h2)
+
+        return value1, value2, (new_h1, new_h2)
