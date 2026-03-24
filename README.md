@@ -1,7 +1,7 @@
 # Dual-Gated Epistemic Time-Dilation: Autonomous Compute Modulation in Asynchronous MARL
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://zenodo.org/records/19206838)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://zenodo.org/records/19206838) currenlty zanodo, arxiv tb linked
 
 
 This repository contains implementation of **Epistemic Time-Dilation MAPPO (ETD-MAPPO)**. As Multi-Agent Reinforcement Learning (MARL) algorithms achieve unprecedented successes across complex continuous domains, their standard deployment strictly adheres to a synchronous operational paradigm. ETD-MAPPO proposes a departure from synchronous determinism by allowing agents to autonomously modulate their own execution frequency.
