@@ -1,10 +1,10 @@
 # Dual-Gated Epistemic Time-Dilation: Autonomous Compute Modulation in Asynchronous MARL
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](PublicationDraft.pdf) -> tb linked
 
 
-This repository contains the official implementation of **Epistemic Time-Dilation MAPPO (ETD-MAPPO)**. As Multi-Agent Reinforcement Learning (MARL) algorithms achieve unprecedented successes across complex continuous domains, their standard deployment strictly adheres to a synchronous operational paradigm. ETD-MAPPO proposes a departure from synchronous determinism by allowing agents to autonomously modulate their own execution frequency.
+
+This repository contains implementation of **Epistemic Time-Dilation MAPPO (ETD-MAPPO)**. As Multi-Agent Reinforcement Learning (MARL) algorithms achieve unprecedented successes across complex continuous domains, their standard deployment strictly adheres to a synchronous operational paradigm. ETD-MAPPO proposes a departure from synchronous determinism by allowing agents to autonomously modulate their own execution frequency.
 
 ## Key Contributions
 
@@ -79,18 +79,3 @@ ETD-MAPPO was rigorously evaluated across continuous simulators and grid environ
 * **Level-Based Foraging (LBF):** Epistemic Time-Dilation autonomously maintained alert execution trajectories computing exact instantaneous vectors mapping dense collisions appropriately, correctly achieving a peak 60.0% win completion threshold. In contrast, the rigid Fixed-Skip evaluation model collapsed natively down to exactly 20.0%.
 * **Google Research Football (GRF):** By autonomously forcing execution during out-of-distribution state traversals, ETD-MAPPO securely stabilized the gradient updates, eventually recovering and sustaining a flawless 100.0% goal rate while still capturing a 5.2% localized FLOP reduction.
 * **Multi-Particle Environment (MPE):** Generating long uniform tracking paths safely triggered deep state thresholds permitting evasive entities exclusively tracking massive efficiency yields achieving a robust 73.6% relative computational inference reduction.
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@misc{jankowski2026etdmappo,
-  title={Dual-Gated Epistemic Time-Dilation: Autonomous Compute Modulation in Asynchronous MARL},
-  author={Jankowski, Igor},
-  year={2026},
-  eprint={tbs}, 
-  archivePrefix={arXiv},
-  primaryClass={cs.MA} 
-}
-```
