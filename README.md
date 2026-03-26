@@ -1,7 +1,7 @@
 # Dual-Gated Epistemic Time-Dilation: Autonomous Compute Modulation in Asynchronous MARL
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://zenodo.org/records/19206838) currenlty zanodo, arxiv tb linked
+[![Paper](https://img.shields.io/badge/Paper-PDF-red.svg)](https://arxiv.org/abs/2603.23722)
 
 
 This repository contains implementation of **Epistemic Time-Dilation MAPPO (ETD-MAPPO)**. As Multi-Agent Reinforcement Learning (MARL) algorithms achieve unprecedented successes across complex continuous domains, their standard deployment strictly adheres to a synchronous operational paradigm. ETD-MAPPO proposes a departure from synchronous determinism by allowing agents to autonomously modulate their own execution frequency.
@@ -86,15 +86,13 @@ ETD-MAPPO was rigorously evaluated across continuous simulators and grid environ
 If you use this code in your research, please cite:
 
 ```bibtex
-@misc{jankowski_2026_19206838,
-  author       = {Jankowski, Igor},
-  title        = {Dual-Gated Epistemic Time-Dilation: Autonomous
-                   Compute Modulation in Asynchronous MARL
-                  },
-  month        = mar,
-  year         = 2026,
-  publisher    = {Zenodo},
-  doi          = {10.5281/zenodo.19206838},
-  url          = {https://doi.org/10.5281/zenodo.19206838},
+@misc{jankowski2026dualgatedepistemictimedilationautonomous,
+      title={Dual-Gated Epistemic Time-Dilation: Autonomous Compute Modulation in Asynchronous MARL}, 
+      author={Igor Jankowski},
+      year={2026},
+      eprint={2603.23722},
+      archivePrefix={arXiv},
+      primaryClass={cs.MA},
+      url={https://arxiv.org/abs/2603.23722}, 
 }
 ```
